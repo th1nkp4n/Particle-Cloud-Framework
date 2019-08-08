@@ -34,9 +34,13 @@ class StateMachine(AWSResource):
     }
 
     UPDATE_PARAM_FILTER = {
-        "",
-        "Definition",
-        "RoleArn"
+        "stateMachineArn",
+        "definition",
+        "roleArn"
+    }
+
+    TAG_PARAM_FILTER = {
+        "tags"
     }
 
     UNIQUE_KEYS = ["aws_resource.name"]
@@ -47,13 +51,21 @@ class StateMachine(AWSResource):
 
     def sync_state(self):
         try:
-            self.state= self.get_status()
+            current_description = self.get_state_machine()
+            if current_description is None:
+                self.state= StateMachine.state_lookup.get('missing')
+            else: 
+                self.state = StateMachine.state_lookup.get(current_description["status"].lower()) 
+                self.current_state_definition["name"] = current_description["name"]
+                self.current_state_definition["definition"] = current_description["definition"]
+                self.current_state_definition["roleArn"] = current_description["roleArn"]
+                self.current_state_definition["tags"] = self.client.list_tags_for_resource(resourceArn = self._arn)["tags"]
         except NoResourceException:
             self.state = StateMachine.state_lookup.get('missing')
 
 
     def _terminate(self):
-        resp = self.client.delete_activity(activityArn=self._arn)
+        resp = self.client.delete_state_machine(stateMachineArn=self._arn)
 
     def _start(self):
         """
@@ -62,9 +74,11 @@ class StateMachine(AWSResource):
             response of boto3 create_activity
         """
         start_definition = pcf_util.param_filter(self.get_desired_state_definition(), StateMachine.START_PARAM_FILTER)
-        print(start_definition)
+        #print(start_definition)
         response = self.client.create_state_machine(**start_definition)
-        self._arn = response.stateMachineArn
+        #print(response)
+        self._arn = response["stateMachineArn"]
+        print(self.arn)
         return response
 
     def _stop(self):
@@ -75,20 +89,27 @@ class StateMachine(AWSResource):
 
     def _update(self):
         update_definition = pcf_util.param_filter(self.get_desired_state_definition(), StateMachine.UPDATE_PARAM_FILTER)
-        return self.client.update_state_machine(**update_definition)
+        update_definition["stateMachineArn"] = self._arn
+        update_response = self.client.update_state_machine(**update_definition)
+        tag_response = self.client.tag_resource(resourceArn=self._arn, tags=self.desired_state_definition["tags"])
+        return update_response
     
-    def get_status(self):
+    def get_state_machine(self):
         try:
             if self._arn is not None:
                 current_description = self.client.describe_state_machine(stateMachineArn= self._arn)
-                print(current_description)
-                current_status = current_description.status
             else: 
-                current_status = State.terminated
+                response = self.client.list_state_machines()
+                current_description = None
+                for machine in response["stateMachines"]:
+                    if machine["name"] == self.machine_name:
+                        self._arn = machine["stateMachineArn"]
+                        current_description = self.client.describe_state_machine(stateMachineArn= machine["stateMachineArn"])
+            return current_description
         except ClientError as e:
-            if e.response['Error']['Code'] == 'ResourceNotFoundException':
-                logger.info("Function {} was not found. State is terminated".format(self.machine_name))
-                return State.terminated
+            if e.response['Error']['Code'] == 'StateMachineDoesNotExist':
+                logger.info("State machine {} was not found. State is terminated".format(self.machine_name))
+                return None
             else:
-                raise e
-        return current_status
+                raise e    
+    
